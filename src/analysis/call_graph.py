@@ -151,6 +151,24 @@ def _resolve_call(
         # try the full dotted name as a FQN directly
         if name in index:
             return name, True
+        # ---- instance variable: root not in import map -----------------
+        # e.g. `_svc.get_user` where `_svc` is a module-level instance.
+        # Fall back to searching for the method/function name (tail).
+        method_matches = index.find_by_name(tail)
+        if len(method_matches) == 1:
+            return method_matches[0].fqn, True
+        if len(method_matches) > 1:
+            # Prefer methods (not functions) to avoid matching standalone fns
+            method_only = [m for m in method_matches
+                           if m.kind.value == "method"]
+            if len(method_only) == 1:
+                return method_only[0].fqn, True
+            # Prefer same-module match
+            caller_module = ".".join(caller_fqn.split(".")[:-1])
+            for m in method_matches:
+                if m.module_fqn == caller_module:
+                    return m.fqn, True
+            return method_matches[0].fqn, True
 
     # ---- simple name: check import map first ---------------------------
     if name in import_map:
