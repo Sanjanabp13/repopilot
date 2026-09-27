@@ -14,6 +14,7 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from src.analysis.call_graph import CallGraph
     from src.analysis.symbol_index import SymbolIndex
 
 from src.knowledge.embedder import CodeChunker, Embedder
@@ -72,12 +73,14 @@ class RAGChain:
         confidence_threshold: float = 0.15,
         top_k: int = 5,
         model_id: str = "gemini-1.5-flash",
+        call_graph: "CallGraph | None" = None,
     ) -> None:
         self._vs = vector_store
         self._embedder = embedder
         self._confidence_threshold = confidence_threshold
         self._top_k = top_k
         self._model_id = model_id
+        self._call_graph = call_graph
         self._llm = self._init_llm(model_id)
         self._index: "SymbolIndex | None" = None  # set by index_repository
 
@@ -223,44 +226,20 @@ class RAGChain:
 
         # 6. Generate answer (or fall back to structured context summary)
         if self._llm is None:
-            bullets = []
-            for r in results[:3]:
-                meta = r["metadata"]
-                doc_line = (
-                    r["text"].split("\n")[2]
-                    if len(r["text"].split("\n")) > 2
-                    else ""
-                )
-                bullets.append(
-                    f"- **`{meta.get('fqn','')}`** "
-                    f"(`{meta.get('file_path','').split('/')[-1]}:{meta.get('line',0)}`)"
-                    + (f"\n  > {doc_line.strip()}" if doc_line.strip() else "")
-                )
-            answer_text = (
-                "**Top matches** (LLM not configured — showing retrieved symbols):\n\n"
-                + "\n".join(bullets)
-            )
+            answer_text = self._local_answer(question, results)
         else:
             prompt = _PROMPT_TEMPLATE.format(
                 context_block=context_block,
                 question=question,
             )
             try:
-                response = self._llm.generate_content(prompt)
+                response = self._llm.generate_content(prompt, request_options={"timeout": 7})
                 answer_text = (
                     response.text if hasattr(response, "text") else str(response)
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.error("Gemini LLM generation failed: %s", exc)
-                answer_text = (
-                    "**LLM generation failed.** Top matches:\n\n"
-                    + "\n".join(
-                        f"- `{r['metadata'].get('fqn','')}` — "
-                        f"`{r['metadata'].get('file_path','').split('/')[-1]}"
-                        f":{r['metadata'].get('line',0)}`"
-                        for r in results[:3]
-                    )
-                )
+                logger.warning("Gemini LLM generation failed: %s", exc)
+                answer_text = self._local_answer(question, results)
 
         return {
             "answer": answer_text,
@@ -320,44 +299,80 @@ class RAGChain:
             for c in chunks
         ]
         if self._llm is None:
-            bullets = []
-            for c in chunks[:3]:
-                meta = c["metadata"]
-                doc_line = (
-                    c["text"].split("\n")[2]
-                    if len(c["text"].split("\n")) > 2
-                    else ""
-                )
-                bullets.append(
-                    f"- **`{meta.get('fqn','')}`** "
-                    f"(`{meta.get('file_path','').split('/')[-1]}:{meta.get('line',0)}`)"
-                    + (f"\n  > {doc_line.strip()}" if doc_line.strip() else "")
-                )
-            answer_text = (
-                "**Top keyword matches** (LLM not configured):\n\n"
-                + "\n".join(bullets)
-            )
+            answer_text = self._local_answer(question, chunks)
         else:
             prompt = _PROMPT_TEMPLATE.format(
                 context_block=context_block, question=question
             )
             try:
-                response = self._llm.generate_content(prompt)
+                response = self._llm.generate_content(prompt, request_options={"timeout": 7})
                 answer_text = (
                     response.text if hasattr(response, "text") else str(response)
                 )
             except Exception as exc:
-                logger.error("Gemini LLM generation failed: %s", exc)
-                answer_text = (
-                    "LLM generation failed. Top keyword matches:\n\n"
-                    + context_block[:1000]
-                )
+                logger.warning("Gemini LLM generation failed: %s", exc)
+                answer_text = self._local_answer(question, chunks)
         return {
             "answer": answer_text,
             "citations": citations,
             "confidence": 0.5,
             "retrieved_chunks": len(chunks),
         }
+
+    def _local_answer(self, question: str, results: list[dict]) -> str:
+        """Build a human-readable local answer from retrieved evidence."""
+        if not results:
+            return "I found no repository evidence for that question."
+
+        best = results[0]
+        meta = best["metadata"]
+        fqn = meta.get("fqn", "")
+        file_path = meta.get("file_path", "")
+        line = int(meta.get("line", 0))
+        kind = meta.get("kind", "symbol")
+        snippet = (best.get("text") or "").strip()
+        doc = snippet.splitlines()[0].replace("# ", "") if snippet else ""
+
+        callers = []
+        if self._call_graph and self._call_graph.node(fqn):
+            callers = [
+                caller
+                for caller in self._call_graph.callers_of(fqn)
+                if caller != fqn
+            ]
+        callees = []
+        if self._call_graph and self._call_graph.node(fqn):
+            callees = [
+                callee
+                for callee in self._call_graph.callees_of(fqn)
+                if callee != fqn
+            ]
+
+        name = fqn.split(".")[-1]
+        file_name = file_path.split("/")[-1] if file_path else "unknown"
+        caller_text = ", ".join(callers[:3]) if callers else "no direct callers found"
+        callee_text = ", ".join(callees[:3]) if callees else "no direct calls found"
+
+        answer = (
+            f"I found the following repository evidence for {name}. "
+            f"This {kind} is defined in {file_name}:{line} and appears to {doc.lower() if doc else 'match the repository source.'} "
+            f"The symbol is called by {caller_text}, and it calls {callee_text}. "
+            f"This is the most relevant code path for your question based on the repository index and call graph."
+        )
+        if citations := [
+            {
+                "fqn": r["metadata"].get("fqn", ""),
+                "file_path": r["metadata"].get("file_path", ""),
+                "line": int(r["metadata"].get("line", 0)),
+                "snippet": r.get("text", "")[:200],
+            }
+            for r in results[:3]
+        ]:
+            answer += "\n\nEvidence:\n"
+            answer += "\n".join(
+                f"- {c['fqn']} ({c['file_path'].split('/')[-1]}:{c['line']})" for c in citations
+            )
+        return answer
 
     @staticmethod
     def _no_answer(reason: str) -> dict:

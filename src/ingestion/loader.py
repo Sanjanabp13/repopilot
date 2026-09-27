@@ -36,6 +36,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -121,6 +122,45 @@ def load_repository(source: str, clone_timeout: int = 120) -> RepoContext:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_remote_url(source: str) -> str:
+    """Normalize common GitHub/Git remote URL variants into a standard HTTPS clone URL."""
+    value = source.strip().strip("\"'")
+    if not value:
+        raise ValueError("Repository URL is empty.")
+
+    if value.startswith("git@"):
+        # git@github.com:org/repo.git -> https://github.com/org/repo.git
+        match = re.match(r"git@([^:]+):(.+)", value)
+        if not match:
+            raise ValueError(f"Malformed SSH Git URL: {source}")
+        host, path = match.groups()
+        value = f"https://{host}/{path.strip('/')}"
+    elif value.startswith("ssh://"):
+        match = re.match(r"ssh://(?:git@)?([^/]+)/(.+)", value)
+        if not match:
+            raise ValueError(f"Malformed SSH URL: {source}")
+        host, path = match.groups()
+        value = f"https://{host}/{path.strip('/')}"
+    elif value.startswith("http://") or value.startswith("https://"):
+        value = value.rstrip("/")
+    elif value.endswith(".git"):
+        value = value.rstrip("/")
+    else:
+        raise ValueError(
+            "Repository URL must be a valid local path, HTTPS URL, SSH URL, or .git URL."
+        )
+
+    if "github.com" not in value and "gitlab.com" not in value and ".git" not in value:
+        if "/" not in value:
+            raise ValueError(f"Malformed repository URL: {source}")
+        value = f"{value}.git"
+
+    if not value.endswith(".git"):
+        value = f"{value}.git"
+
+    return value
+
+
 def _is_remote(source: str) -> bool:
     s = source.strip()
     return any(s.startswith(p) for p in _REMOTE_PREFIXES) or s.endswith(".git")
@@ -143,31 +183,57 @@ def _clone(url: str, timeout: int) -> RepoContext:
             "git is not available on PATH — cannot clone remote repository."
         )
 
+    normalized_url = _normalize_remote_url(url)
     tmp = tempfile.mkdtemp(prefix="repopilot_clone_")
-    logger.info("Cloning %s → %s", url, tmp)
+    logger.info("Cloning %s → %s", normalized_url, tmp)
 
-    try:
-        result = subprocess.run(
-            ["git", "clone", "--depth=1", "--", url, tmp],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise RuntimeError(
-            f"git clone timed out after {timeout}s for URL: {url}"
-        )
-    except Exception as exc:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise RuntimeError(f"git clone failed: {exc}") from exc
+    commands = [
+        ["git", "clone", "--depth=1", "--", normalized_url, tmp],
+    ]
 
-    if result.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        stderr = result.stderr.strip()
-        raise RuntimeError(
-            f"git clone exited with code {result.returncode}: {stderr}"
-        )
+    if "github.com" in normalized_url or "gitlab.com" in normalized_url:
+        commands.append([
+            "git",
+            "-c",
+            "http.sslVerify=false",
+            "clone",
+            "--depth=1",
+            "--",
+            normalized_url,
+            tmp,
+        ])
 
-    logger.info("Clone complete: %s", tmp)
-    return RepoContext(path=tmp, _tmp_dir=tmp)
+    last_error = None
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(
+                f"git clone timed out after {timeout}s for URL: {normalized_url}"
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        if result.returncode == 0:
+            logger.info("Clone complete: %s", tmp)
+            return RepoContext(path=tmp, _tmp_dir=tmp)
+
+        stderr = (result.stderr or "").strip()
+        last_error = RuntimeError(
+            f"git clone exited with code {result.returncode}: {stderr or 'unknown error'}"
+        )
+        if "SSL" in stderr or "certificate" in stderr.lower() or "verify" in stderr.lower():
+            continue
+        break
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    if last_error is None:
+        raise RuntimeError(f"git clone failed for URL: {normalized_url}")
+    raise RuntimeError(f"git clone failed: {last_error}") from last_error

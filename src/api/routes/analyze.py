@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 
 from src.api.models import AnalyzeRequest, AnalyzeResponse
@@ -22,15 +24,14 @@ router = APIRouter()
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
-    # Load repo
+async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     try:
-        ctx = load_repository(req.source)
-    except (NotADirectoryError, RuntimeError) as exc:
+        ctx = await asyncio.to_thread(load_repository, req.source, 180)
+    except (NotADirectoryError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     languages = set(req.languages or ["python"])
-    source_files = walk_repository(ctx.path, languages=languages)
+    source_files = await asyncio.to_thread(walk_repository, ctx.path, languages=languages)
     if not source_files:
         raise HTTPException(status_code=422, detail="No source files found.")
 
@@ -48,7 +49,7 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     vs = VectorStore(persist_dir=".repopilot/chroma")
     vs.clear()
     embedder  = Embedder()
-    rag_chain = RAGChain(vector_store=vs, embedder=embedder)
+    rag_chain = RAGChain(vector_store=vs, embedder=embedder, call_graph=call_graph)
     indexed_chunks = rag_chain.index_repository(index, parse_results)
 
     analysis_id = session_store.new_session()

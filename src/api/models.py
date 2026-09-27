@@ -71,10 +71,28 @@ class TraceResponse(BaseModel):
 # /diagram
 # ---------------------------------------------------------------------------
 
+class GraphNodeSchema(BaseModel):
+    id: str
+    label: str
+    kind: str
+    file_path: str = ""
+    line: int = 0
+    is_internal: bool = True
+
+
+class GraphEdgeSchema(BaseModel):
+    id: str
+    source: str
+    target: str
+    label: str = ""
+    resolved: bool = True
+
+
 class DiagramResponse(BaseModel):
     analysis_id: str
     kind: str          # "call_graph" | "dep_graph"
     diagram: str       # Mermaid markdown
+    graph: Dict[str, List[Any]] = Field(default_factory=lambda: {"nodes": [], "edges": []})
 
 
 # ---------------------------------------------------------------------------
