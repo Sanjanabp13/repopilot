@@ -2,9 +2,9 @@
 rag_chain.py — Retrieval-Augmented Generation over the RepoPilot symbol index.
 
 Class: RAGChain
-  Orchestrates CodeChunker → Embedder → VectorStore → IBM Granite LLM to answer
-  natural-language questions about a codebase, with exact file-path + line
-  citations.  No LangChain is used; everything is hand-rolled.
+  Orchestrates CodeChunker → Embedder → VectorStore → Google Gemini LLM to
+  answer natural-language questions about a codebase, with exact file-path +
+  line citations.  No LangChain is used; everything is hand-rolled.
 """
 
 from __future__ import annotations
@@ -26,11 +26,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PROMPT_TEMPLATE = """\
-You are a code documentation assistant for the RepoPilot project.
+You are an expert code documentation assistant for the RepoPilot project.
 Answer the question based ONLY on the provided code context.
 Always cite the exact file path and line number for any claim you make.
 If the context does not contain enough information, say "I don't have enough context to answer."
 Do not guess or make up information about the code.
+Be concise but thorough. Use Markdown formatting.
 
 Context:
 {context_block}
@@ -42,6 +43,7 @@ Answer (with citations):"""
 # ---------------------------------------------------------------------------
 # RAGChain
 # ---------------------------------------------------------------------------
+
 
 class RAGChain:
     """End-to-end RAG pipeline for codebase Q&A.
@@ -60,7 +62,7 @@ class RAGChain:
     top_k:
         Number of chunks to retrieve per question.
     model_id:
-        IBM Granite model identifier used for generation.
+        Google Gemini model identifier used for generation.
     """
 
     def __init__(
@@ -69,15 +71,15 @@ class RAGChain:
         embedder: Embedder,
         confidence_threshold: float = 0.15,
         top_k: int = 5,
-        model_id: str = "ibm/granite-3-8b-instruct",
+        model_id: str = "gemini-1.5-flash",
     ) -> None:
-        self._vs                   = vector_store
-        self._embedder             = embedder
+        self._vs = vector_store
+        self._embedder = embedder
         self._confidence_threshold = confidence_threshold
-        self._top_k                = top_k
-        self._model_id             = model_id
-        self._llm                  = self._init_llm(model_id)
-        self._index: "SymbolIndex | None" = None   # set by index_repository
+        self._top_k = top_k
+        self._model_id = model_id
+        self._llm = self._init_llm(model_id)
+        self._index: "SymbolIndex | None" = None  # set by index_repository
 
     # ------------------------------------------------------------------
     # LLM initialisation
@@ -85,40 +87,37 @@ class RAGChain:
 
     @staticmethod
     def _init_llm(model_id: str):
-        """Initialise the watsonx.ai ModelInference client.
+        """Initialise the Google Gemini GenerativeModel client.
 
         Returns ``None`` (graceful degradation) if credentials are absent
         or the SDK is not installed.
         """
-        url    = os.environ.get("WATSONX_URL")
-        apikey = os.environ.get("WATSONX_APIKEY")
-        proj   = os.environ.get("WATSONX_PROJECT_ID")
+        apikey = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
-        if not (url and apikey and proj):
+        if not apikey:
             logger.warning(
-                "WATSONX_URL / WATSONX_APIKEY / WATSONX_PROJECT_ID not set; "
+                "GOOGLE_API_KEY / GEMINI_API_KEY not set; "
                 "LLM generation disabled (context-only mode)."
             )
             return None
 
         try:
-            from ibm_watsonx_ai import APIClient, Credentials
-            from ibm_watsonx_ai.foundation_models import ModelInference
+            import google.generativeai as genai
 
-            creds  = Credentials(url=url, api_key=apikey)
-            client = APIClient(credentials=creds, project_id=proj)
-            llm = ModelInference(
-                model_id=model_id,
-                api_client=client,
-                params={
-                    "max_new_tokens": 512,
-                    "temperature":    0.0,
+            genai.configure(api_key=apikey)
+            model = genai.GenerativeModel(
+                model_name=model_id,
+                generation_config={
+                    "temperature": 0.2,
+                    "max_output_tokens": 1024,
                 },
             )
-            logger.info("RAGChain: LLM initialised (model=%s)", model_id)
-            return llm
+            logger.info("RAGChain: Gemini LLM initialised (model=%s)", model_id)
+            return model
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to initialise watsonx LLM: %s — running without LLM.", exc)
+            logger.warning(
+                "Failed to initialise Gemini LLM: %s — running without LLM.", exc
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -131,15 +130,15 @@ class RAGChain:
         parse_results: list[dict],
     ) -> int:
         """Chunk, embed, and store every chunkable symbol in *index*."""
-        self._index = index   # keep reference for keyword fallback
+        self._index = index  # keep reference for keyword fallback
         chunker = CodeChunker()
-        chunks  = chunker.chunk_symbols(index, parse_results)
+        chunks = chunker.chunk_symbols(index, parse_results)
 
         if not chunks:
             logger.warning("No chunkable symbols found in index.")
             return 0
 
-        texts      = [c["text"] for c in chunks]
+        texts = [c["text"] for c in chunks]
         embeddings = self._embedder.embed(texts)
 
         if not embeddings:
@@ -200,9 +199,9 @@ class RAGChain:
         context_parts = []
         for r in results:
             meta = r["metadata"]
-            fqn  = meta.get("fqn", "")
-            fp   = meta.get("file_path", "")
-            ln   = meta.get("line", 0)
+            fqn = meta.get("fqn", "")
+            fp = meta.get("file_path", "")
+            ln = meta.get("line", 0)
             kind = meta.get("kind", "symbol")
             context_parts.append(
                 f"### `{fqn}` ({kind})\n"
@@ -214,21 +213,24 @@ class RAGChain:
         # 5. Build citations
         citations = [
             {
-                "fqn":       r["metadata"].get("fqn", ""),
+                "fqn": r["metadata"].get("fqn", ""),
                 "file_path": r["metadata"].get("file_path", ""),
-                "line":      int(r["metadata"].get("line", 0)),
-                "snippet":   r["text"][:200],
+                "line": int(r["metadata"].get("line", 0)),
+                "snippet": r["text"][:200],
             }
             for r in results
         ]
 
         # 6. Generate answer (or fall back to structured context summary)
         if self._llm is None:
-            # Format as a clean Markdown summary of top hits
             bullets = []
             for r in results[:3]:
                 meta = r["metadata"]
-                doc_line = r["text"].split("\n")[2] if len(r["text"].split("\n")) > 2 else ""
+                doc_line = (
+                    r["text"].split("\n")[2]
+                    if len(r["text"].split("\n")) > 2
+                    else ""
+                )
                 bullets.append(
                     f"- **`{meta.get('fqn','')}`** "
                     f"(`{meta.get('file_path','').split('/')[-1]}:{meta.get('line',0)}`)"
@@ -244,10 +246,12 @@ class RAGChain:
                 question=question,
             )
             try:
-                response    = self._llm.generate_text(prompt=prompt)
-                answer_text = response if isinstance(response, str) else str(response)
+                response = self._llm.generate_content(prompt)
+                answer_text = (
+                    response.text if hasattr(response, "text") else str(response)
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.error("LLM generation failed: %s", exc)
+                logger.error("Gemini LLM generation failed: %s", exc)
                 answer_text = (
                     "**LLM generation failed.** Top matches:\n\n"
                     + "\n".join(
@@ -259,9 +263,9 @@ class RAGChain:
                 )
 
         return {
-            "answer":           answer_text,
-            "citations":        citations,
-            "confidence":       round(max_score, 4),
+            "answer": answer_text,
+            "citations": citations,
+            "confidence": round(max_score, 4),
             "retrieved_chunks": len(results),
         }
 
@@ -276,25 +280,29 @@ class RAGChain:
         tokens = set(question.lower().split())
         hits = []
         for sym in self._index.all_symbols():
-            if sym.name.lower() in tokens or any(t in sym.name.lower() for t in tokens if len(t) > 3):
-                hits.append({
-                    "id":       sym.fqn,
-                    "text":     (
-                        f"# {sym.kind.value}: {sym.fqn}\n"
-                        f"# File: {sym.file_path}:{sym.line}\n"
-                        f"{sym.docstring or ''}"
-                    ),
-                    "metadata": {
-                        "fqn":       sym.fqn,
-                        "file_path": sym.file_path,
-                        "line":      sym.line,
-                        "kind":      sym.kind.value,
-                        "name":      sym.name,
-                    },
-                    "distance": 0.5,
-                    "score":    0.5,
-                })
-        return hits[:self._top_k]
+            if sym.name.lower() in tokens or any(
+                t in sym.name.lower() for t in tokens if len(t) > 3
+            ):
+                hits.append(
+                    {
+                        "id": sym.fqn,
+                        "text": (
+                            f"# {sym.kind.value}: {sym.fqn}\n"
+                            f"# File: {sym.file_path}:{sym.line}\n"
+                            f"{sym.docstring or ''}"
+                        ),
+                        "metadata": {
+                            "fqn": sym.fqn,
+                            "file_path": sym.file_path,
+                            "line": sym.line,
+                            "kind": sym.kind.value,
+                            "name": sym.name,
+                        },
+                        "distance": 0.5,
+                        "score": 0.5,
+                    }
+                )
+        return hits[: self._top_k]
 
     def _keyword_fallback(self, question: str) -> dict:
         """Full fallback when vector store has no results at all."""
@@ -304,10 +312,10 @@ class RAGChain:
         context_block = "\n\n---\n\n".join(c["text"] for c in chunks)
         citations = [
             {
-                "fqn":       c["metadata"]["fqn"],
+                "fqn": c["metadata"]["fqn"],
                 "file_path": c["metadata"]["file_path"],
-                "line":      int(c["metadata"]["line"]),
-                "snippet":   c["text"][:200],
+                "line": int(c["metadata"]["line"]),
+                "snippet": c["text"][:200],
             }
             for c in chunks
         ]
@@ -315,7 +323,11 @@ class RAGChain:
             bullets = []
             for c in chunks[:3]:
                 meta = c["metadata"]
-                doc_line = c["text"].split("\n")[2] if len(c["text"].split("\n")) > 2 else ""
+                doc_line = (
+                    c["text"].split("\n")[2]
+                    if len(c["text"].split("\n")) > 2
+                    else ""
+                )
                 bullets.append(
                     f"- **`{meta.get('fqn','')}`** "
                     f"(`{meta.get('file_path','').split('/')[-1]}:{meta.get('line',0)}`)"
@@ -326,17 +338,24 @@ class RAGChain:
                 + "\n".join(bullets)
             )
         else:
-            prompt = _PROMPT_TEMPLATE.format(context_block=context_block, question=question)
+            prompt = _PROMPT_TEMPLATE.format(
+                context_block=context_block, question=question
+            )
             try:
-                response = self._llm.generate_text(prompt=prompt)
-                answer_text = response if isinstance(response, str) else str(response)
+                response = self._llm.generate_content(prompt)
+                answer_text = (
+                    response.text if hasattr(response, "text") else str(response)
+                )
             except Exception as exc:
-                logger.error("LLM generation failed: %s", exc)
-                answer_text = "LLM generation failed. Top keyword matches:\n\n" + context_block[:1000]
+                logger.error("Gemini LLM generation failed: %s", exc)
+                answer_text = (
+                    "LLM generation failed. Top keyword matches:\n\n"
+                    + context_block[:1000]
+                )
         return {
-            "answer":           answer_text,
-            "citations":        citations,
-            "confidence":       0.5,
+            "answer": answer_text,
+            "citations": citations,
+            "confidence": 0.5,
             "retrieved_chunks": len(chunks),
         }
 
@@ -344,9 +363,9 @@ class RAGChain:
     def _no_answer(reason: str) -> dict:
         logger.warning("RAGChain: no answer — %s", reason)
         return {
-            "answer":           "No confident answer found for this question.",
-            "citations":        [],
-            "confidence":       0.0,
+            "answer": "No confident answer found for this question.",
+            "citations": [],
+            "confidence": 0.0,
             "retrieved_chunks": 0,
         }
 
@@ -362,7 +381,6 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    # Ensure src/ is importable
     repo_root = Path(__file__).resolve().parents[2]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
@@ -371,7 +389,7 @@ if __name__ == "__main__":
     from src.ingestion.parsers.python_parser import PythonParser  # type: ignore[import]
 
     fixture_dir = repo_root / "tests" / "fixtures" / "sample_project"
-    parser      = PythonParser()
+    parser = PythonParser()
 
     parse_results: list[dict] = []
     index = SymbolIndex()
@@ -384,11 +402,11 @@ if __name__ == "__main__":
     print(f"[main] Symbol index built: {len(index)} symbols")
 
     embedder = Embedder()
-    vs       = VectorStore(persist_dir=".repopilot/chroma_demo")
+    vs = VectorStore(persist_dir=".repopilot/chroma_demo")
     vs.clear()
 
     chain = RAGChain(vector_store=vs, embedder=embedder)
-    n     = chain.index_repository(index, parse_results)
+    n = chain.index_repository(index, parse_results)
     print(f"[main] Indexed {n} chunks")
 
     question = "What does UserService.get_user do?"

@@ -349,3 +349,19 @@ class TestImpactAnalyzer:
         summary = result.summary()
         assert "Impact report" in summary
         assert "Direct callers" in summary
+
+    # ---- Short-name and partial FQN resolution -------------------------
+
+    def test_get_user_by_short_name(self, analysis):
+        analyzer = analysis["analyzer"]
+        result = analyzer.get_downstream_impact("get_user")
+        assert result.total_impact > 0
+        direct_fqns = fqns(result.direct_callers)
+        assert any("get_user_handler" in f for f in direct_fqns)
+
+    def test_get_user_by_partial_fqn(self, analysis):
+        analyzer = analysis["analyzer"]
+        result = analyzer.get_downstream_impact("UserService.get_user")
+        assert result.total_impact > 0
+        direct_fqns = fqns(result.direct_callers)
+        assert any("get_user_handler" in f for f in direct_fqns)

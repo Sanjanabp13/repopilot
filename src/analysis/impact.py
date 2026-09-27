@@ -175,10 +175,18 @@ class ImpactResult:
 # ---------------------------------------------------------------------------
 
 def _is_test_path(file_path: str) -> bool:
-    """Heuristic: any path segment containing 'test' is a test file."""
+    """Heuristic: check whether the file path or symbol name indicates a test."""
     from pathlib import Path
-    parts = Path(file_path).parts
-    return any("test" in part.lower() for part in parts)
+    p = Path(file_path)
+    name = p.name.lower()
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    if "test" in p.stem.lower():
+        return True
+    for part in p.parts[-3:-1]:
+        if part.lower() in ("test", "tests", "testing"):
+            return True
+    return False
 
 
 def _make_impacted(symbol: Symbol, hop: int) -> ImpactedSymbol:
@@ -234,32 +242,74 @@ class ImpactAnalyzer:
         self._graph      = call_graph
         self._max_hops   = max_hops
 
+    def _resolve_symbol_fqn(self, symbol_fqn: str) -> str:
+        """Resolve a short name, partial FQN, or symbol name to a known node FQN."""
+        # 1. Exact match in call graph
+        if self._graph.node(symbol_fqn) is not None:
+            return symbol_fqn
+
+        # 2. Exact match in symbol index
+        sym = self._index.lookup(symbol_fqn)
+        if sym and self._graph.node(sym.fqn) is not None:
+            return sym.fqn
+
+        # 3. If symbol_fqn has dots (e.g. UserService.get_user), check suffix match
+        if "." in symbol_fqn:
+            suffix = f".{symbol_fqn}"
+            graph_matches = [
+                n.fqn for n in self._graph.all_nodes()
+                if n.fqn == symbol_fqn or n.fqn.endswith(suffix)
+            ]
+            if graph_matches:
+                with_callers = [
+                    fqn for fqn in graph_matches
+                    if len(self._graph.callers_of(fqn)) > 0
+                ]
+                return with_callers[0] if with_callers else graph_matches[0]
+
+        # 4. Short-name lookup via index
+        simple_name = symbol_fqn.split(".")[-1]
+        matches = self._index.find_by_name(simple_name)
+        if matches:
+            graph_matched = [
+                m.fqn for m in matches
+                if self._graph.node(m.fqn) is not None
+            ]
+            with_callers = [
+                fqn for fqn in graph_matched
+                if len(self._graph.callers_of(fqn)) > 0
+            ]
+            if with_callers:
+                return with_callers[0]
+            if graph_matched:
+                return graph_matched[0]
+            methods = [m for m in matches if m.kind == SymbolKind.METHOD]
+            return (methods[0] if methods else matches[0]).fqn
+
+        # 5. Check call graph nodes by simple name
+        nodes_by_name = [
+            n for n in self._graph.all_nodes()
+            if n.fqn.split(".")[-1] == simple_name or n.fqn.endswith(f".{simple_name}")
+        ]
+        if nodes_by_name:
+            with_callers = [n.fqn for n in nodes_by_name if len(n.called_by) > 0]
+            return with_callers[0] if with_callers else nodes_by_name[0].fqn
+
+        return symbol_fqn
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def get_downstream_impact(self, symbol_fqn: str) -> ImpactResult:
-        """Return the full blast-radius report for *symbol_fqn*.
-
-        Parameters
-        ----------
-        symbol_fqn:
-            Fully-qualified name of the symbol that is changing.
-
-        Returns
-        -------
-        ImpactResult
-            Structured, JSON-serialisable impact report.
-        """
-        # Enrich the changed symbol itself
-        changed_sym_raw = self._index.lookup(symbol_fqn)
+    def _compute_bfs(self, target_fqn: str) -> ImpactResult:
+        """Run reverse BFS starting from a single resolved symbol FQN."""
+        changed_sym_raw = self._index.lookup(target_fqn)
         changed_symbol = (
             _make_impacted(changed_sym_raw, 0) if changed_sym_raw else None
         )
 
-        # ---- BFS over reverse call edges --------------------------------
         visited: Dict[str, int] = {}   # fqn → first-seen hop count
-        queue: deque[tuple[str, int]] = deque([(symbol_fqn, 0)])
+        queue: deque[tuple[str, int]] = deque([(target_fqn, 0)])
 
         while queue:
             current_fqn, hop = queue.popleft()
@@ -270,7 +320,7 @@ class ImpactAnalyzer:
 
             for edge in node.called_by:
                 caller_fqn = edge.caller_fqn
-                if caller_fqn == symbol_fqn:
+                if caller_fqn == target_fqn:
                     continue                    # skip self-reference
                 next_hop = hop + 1
                 if caller_fqn in visited:
@@ -311,7 +361,7 @@ class ImpactAnalyzer:
         affected_tests.sort(key=lambda s: s.fqn)
 
         return ImpactResult(
-            changed_fqn        = symbol_fqn,
+            changed_fqn        = target_fqn,
             changed_symbol     = changed_symbol,
             direct_callers     = direct_callers,
             transitive_callers = transitive_callers,
@@ -319,27 +369,50 @@ class ImpactAnalyzer:
             affected_files     = sorted(affected_files),
         )
 
+    def get_downstream_impact(self, symbol_fqn: str) -> ImpactResult:
+        """Return the full blast-radius report for *symbol_fqn*.
+
+        Parameters
+        ----------
+        symbol_fqn:
+            Fully-qualified name or short name of the symbol that is changing.
+
+        Returns
+        -------
+        ImpactResult
+            Structured, JSON-serialisable impact report.
+        """
+        resolved_fqn = self._resolve_symbol_fqn(symbol_fqn)
+
+        # Delegate class refactor to get_impact_for_class
+        resolved_sym = self._index.lookup(resolved_fqn)
+        if resolved_sym and resolved_sym.kind == SymbolKind.CLASS:
+            return self.get_impact_for_class(resolved_fqn)
+
+        return self._compute_bfs(resolved_fqn)
+
     def get_impact_for_class(self, class_fqn: str) -> ImpactResult:
         """Return the union impact for a class *and* all its methods.
 
         Useful when an entire class is being refactored: every caller of
         every method is included in one report.
         """
-        class_sym = self._index.lookup(class_fqn)
+        resolved_class_fqn = self._resolve_symbol_fqn(class_fqn)
+        class_sym = self._index.lookup(resolved_class_fqn)
         if class_sym is None or class_sym.kind != SymbolKind.CLASS:
-            return self.get_downstream_impact(class_fqn)
+            return self._compute_bfs(resolved_class_fqn)
 
         # Collect method FQNs
         method_fqns = [
             s.fqn
             for s in self._index.symbols_in_module(class_sym.module_fqn)
-            if s.kind == SymbolKind.METHOD and s.parent_fqn == class_fqn
+            if s.kind == SymbolKind.METHOD and s.parent_fqn == resolved_class_fqn
         ]
 
         # Union BFS across class + all methods
         merged: Dict[str, ImpactedSymbol] = {}
-        for fqn in [class_fqn] + method_fqns:
-            sub = self.get_downstream_impact(fqn)
+        for fqn in [resolved_class_fqn] + method_fqns:
+            sub = self._compute_bfs(fqn)
             for sym in sub.all_impacted():
                 if sym.fqn not in merged or sym.hop < merged[sym.fqn].hop:
                     merged[sym.fqn] = sym
@@ -349,9 +422,9 @@ class ImpactAnalyzer:
         affected_tests     = [s for s in merged.values() if s.is_test]
         affected_files     = sorted({s.file_path for s in merged.values() if s.file_path})
 
-        changed_sym_raw = self._index.lookup(class_fqn)
+        changed_sym_raw = self._index.lookup(resolved_class_fqn)
         return ImpactResult(
-            changed_fqn        = class_fqn,
+            changed_fqn        = resolved_class_fqn,
             changed_symbol     = _make_impacted(changed_sym_raw, 0) if changed_sym_raw else None,
             direct_callers     = sorted(direct_callers, key=lambda s: s.fqn),
             transitive_callers = sorted(transitive_callers, key=lambda s: (s.hop, s.fqn)),

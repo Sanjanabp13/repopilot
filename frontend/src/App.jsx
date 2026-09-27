@@ -1,17 +1,26 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import mermaid from 'mermaid'
 
 const API = 'http://localhost:8000'
 
+// ── Initialize Mermaid with clean spacing & dark palette ──────────────────────
 mermaid.initialize({
-  startOnLoad:  false,
-  theme:        'neutral',
-  securityLevel:'loose',
-  maxTextSize:  1000000,
-  maxEdges:     1000,
+  startOnLoad: false,
+  theme: 'dark',
+  securityLevel: 'loose',
+  maxTextSize: 1000000,
+  maxEdges: 1200,
+  flowchart: {
+    curve: 'basis',
+    nodeSpacing: 50,
+    rankSpacing: 65,
+    padding: 16,
+    useMaxWidth: false,
+    htmlLabels: true,
+  },
 })
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── HTTP API helpers ─────────────────────────────────────────────────────────
 
 async function post(path, body) {
   const r = await fetch(`${API}${path}`, {
@@ -32,22 +41,21 @@ async function get(path) {
   return r.json()
 }
 
-// ── strip ```mermaid fences + remove front-matter that breaks the parser ─────
+// ── Strip ```mermaid fences & title headers ───────────────────────────────────
 
 function stripFences(raw) {
+  if (!raw) return ''
   return raw
     .trim()
     .replace(/^```mermaid\s*/i, '')
     .replace(/^```\s*/i, '')
     .replace(/\s*```$/, '')
-    // strip YAML front-matter block  ---\n...\n---
     .replace(/^---[\s\S]*?---\s*/m, '')
-    // strip any stray  "title: …"  lines
     .replace(/^title:.*$/gm, '')
     .trim()
 }
 
-// ── simple Markdown → HTML renderer (bold, inline code, bullets, blockquote) ─
+// ── Markdown → HTML formatter ────────────────────────────────────────────────
 
 function renderMarkdown(text) {
   if (!text) return ''
@@ -62,6 +70,7 @@ function renderMarkdown(text) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     // blockquote
     .replace(/^  &gt; (.+)$/gm, '<blockquote>$1</blockquote>')
+    .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
     // headers
     .replace(/^### (.+)$/gm, '<h4 class="md-h4">$1</h4>')
     .replace(/^## (.+)$/gm, '<h3 class="md-h3">$1</h3>')
@@ -73,74 +82,192 @@ function renderMarkdown(text) {
     .replace(/\n/g, '<br/>')
 }
 
-// ── build nodeId → full FQN map from the diagram source ─────────────────────
-// The renderer emits:  click {nid} callback "{full.fqn}"
-// We parse that to get a reliable id→fqn lookup so clicks send the FQN.
+// ── Parse Mermaid click callbacks to build nodeId → full FQN map ─────────────
 
 function buildFqnMap(diagramSource) {
   const map = {}
   const re = /^\s*click\s+(\S+)\s+callback\s+"([^"]+)"/gm
   let m
   while ((m = re.exec(diagramSource)) !== null) {
-    map[m[1]] = m[2]   // nid → fqn
+    map[m[1]] = m[2]
   }
   return map
 }
 
-// ── Mermaid diagram component ─────────────────────────────────────────────────
+function fqnToId(fqn) {
+  return fqn.replace(/[^A-Za-z0-9_]/g, '_')
+}
 
-function Diagram({ code, onNodeClick, containerRef }) {
+// ── Diagram Component with In-Place Blast Radius Highlighting ─────────────────
+
+function Diagram({ code, onNodeClick, impact, containerRef }) {
   const innerRef = useRef(null)
-  const ref      = containerRef || innerRef   // allow parent to own the DOM ref
+  const ref = containerRef || innerRef
   const countRef = useRef(0)
+  const fqnMapRef = useRef({})
 
+  // 1. Render Diagram SVG
   useEffect(() => {
     if (!code || !ref.current) return
     const clean = stripFences(code)
     if (!clean) return
+
     ref.current.innerHTML = ''
-    const id    = `mermaid_${Date.now()}_${++countRef.current}`
-    const fqnMap = buildFqnMap(clean)   // nodeId → full FQN
+    const id = `mermaid_${Date.now()}_${++countRef.current}`
+    const fqnMap = buildFqnMap(clean)
+    fqnMapRef.current = fqnMap
 
     mermaid.render(id, clean).then(({ svg }) => {
+      if (!ref.current) return
       ref.current.innerHTML = svg
-      ref.current.querySelectorAll('.node').forEach(el => {
+      const svgEl = ref.current.querySelector('svg')
+      if (!svgEl) return
+
+      // Make SVG nodes clickable
+      svgEl.querySelectorAll('.node').forEach(el => {
         el.style.cursor = 'pointer'
-        el.addEventListener('click', () => {
-          // Mermaid sets the SVG node id as  "flowchart-{nid}-NNN"
-          // Extract the nid part and look up the FQN.
-          const svgId  = el.id || ''                          // e.g. "flowchart-sample_project_api_get_user-42"
-          const parts  = svgId.replace(/^flowchart-/, '').split('-')
-          // The nid is everything except the trailing numeric index
-          // Try progressively shorter prefixes until we get a fqnMap hit
+        el.addEventListener('click', (e) => {
+          e.stopPropagation()
+          const svgId = el.id || ''
+          const parts = svgId.replace(/^flowchart-/, '').split('-')
+
+          // Extract candidate nodeId
           let fqn = null
           for (let i = parts.length - 1; i >= 1; i--) {
-            const candidate = parts.slice(0, i).join('_')
+            const candidate = parts.slice(0, i).join('-')
             if (fqnMap[candidate]) { fqn = fqnMap[candidate]; break }
+            const candidateUnderscore = parts.slice(0, i).join('_')
+            if (fqnMap[candidateUnderscore]) { fqn = fqnMap[candidateUnderscore]; break }
           }
-          // Fallback: also check the full id minus the last "-N" segment
+
           if (!fqn) {
             const noSuffix = svgId.replace(/^flowchart-/, '').replace(/-\d+$/, '')
             fqn = fqnMap[noSuffix] || null
           }
-          // Last resort: use the visible label text
+
           if (!fqn) {
-            fqn = el.querySelector('span,text')?.textContent?.trim() || null
+            fqn = el.querySelector('span, text')?.textContent?.trim() || null
           }
-          if (fqn && onNodeClick) onNodeClick(fqn)
+
+          if (fqn && onNodeClick) {
+            onNodeClick(fqn)
+          }
         })
       })
+
+      // Re-apply blast radius highlight if active
+      applyBlastRadius(ref.current, impact, fqnMap)
     }).catch(err => {
       console.error('Mermaid render error:', err)
-      ref.current.innerHTML =
-        `<pre class="mermaid-error">Diagram error: ${err.message}\n\n${clean.slice(0, 300)}</pre>`
+      if (ref.current) {
+        ref.current.innerHTML =
+          `<pre class="mermaid-error">Diagram render error: ${err.message}\n\n${clean.slice(0, 300)}</pre>`
+      }
     })
   }, [code])
+
+  // 2. React to Impact changes without replacing the entire graph
+  useEffect(() => {
+    if (!ref.current) return
+    applyBlastRadius(ref.current, impact, fqnMapRef.current)
+  }, [impact])
 
   return <div ref={ref} className="diagram-container" />
 }
 
-// ── main app ──────────────────────────────────────────────────────────────────
+// ── In-Place Blast Radius Highlighting Logic (Requirement 3) ───────────────────
+
+function applyBlastRadius(container, impact, fqnMap) {
+  if (!container) return
+  const svg = container.querySelector('svg')
+  if (!svg) return
+
+  // Reset any previous highlight classes
+  svg.classList.remove('graph-blast-active')
+  svg.querySelectorAll('.node').forEach(n => {
+    n.classList.remove('node-target', 'node-direct', 'node-transitive', 'node-test', 'node-dimmed')
+    // Remove test badge icon if present
+    const testIcon = n.querySelector('.test-icon-badge')
+    if (testIcon) testIcon.remove()
+  })
+  svg.querySelectorAll('.edgePath').forEach(e => {
+    e.classList.remove('edge-highlighted', 'edge-dimmed')
+  })
+
+  // If no blast radius selected, stay in normal full graph view
+  if (!impact) return
+
+  svg.classList.add('graph-blast-active')
+
+  const targetFqn = impact.changed_fqn || ''
+  const targetId = fqnToId(targetFqn)
+  const targetSimple = targetFqn.split('.').pop()
+
+  const directFqns = new Set((impact.direct_callers || []).map(s => s.fqn))
+  const directSimples = new Set((impact.direct_callers || []).map(s => s.name || s.fqn.split('.').pop()))
+  const directIds = new Set((impact.direct_callers || []).map(s => fqnToId(s.fqn)))
+
+  const transitiveFqns = new Set((impact.transitive_callers || []).map(s => s.fqn))
+  const transitiveSimples = new Set((impact.transitive_callers || []).map(s => s.name || s.fqn.split('.').pop()))
+  const transitiveIds = new Set((impact.transitive_callers || []).map(s => fqnToId(s.fqn)))
+
+  const testFqns = new Set((impact.affected_tests || []).map(s => s.fqn))
+  const testSimples = new Set((impact.affected_tests || []).map(s => s.name || s.fqn.split('.').pop()))
+  const testIds = new Set((impact.affected_tests || []).map(s => fqnToId(s.fqn)))
+
+  const blastIds = new Set([targetId, ...directIds, ...transitiveIds, ...testIds])
+
+  svg.querySelectorAll('.node').forEach(nodeEl => {
+    const svgId = nodeEl.id || ''
+    const rawId = svgId.replace(/^flowchart-/, '').replace(/-\d+$/, '')
+    const fqn = fqnMap[rawId] || ''
+    const textLabel = nodeEl.querySelector('span, text')?.textContent?.trim() || ''
+
+    const isTarget = fqn === targetFqn || rawId === targetId || textLabel === targetSimple
+    const isTest = testFqns.has(fqn) || testIds.has(rawId) || testSimples.has(textLabel)
+    const isDirect = directFqns.has(fqn) || directIds.has(rawId) || directSimples.has(textLabel)
+    const isTransitive = transitiveFqns.has(fqn) || transitiveIds.has(rawId) || transitiveSimples.has(textLabel)
+
+    if (isTarget) {
+      nodeEl.classList.add('node-target')
+    } else if (isTest) {
+      nodeEl.classList.add('node-test')
+      // Append small test icon indicator 🧪
+      const label = nodeEl.querySelector('.label')
+      if (label && !label.querySelector('.test-icon-badge')) {
+        const badge = document.createElementNS('http://www.w3.org/2000/svg', 'text')
+        badge.setAttribute('class', 'test-icon-badge')
+        badge.setAttribute('y', '-6')
+        badge.setAttribute('x', '0')
+        badge.textContent = '🧪'
+        label.appendChild(badge)
+      }
+    } else if (isDirect) {
+      nodeEl.classList.add('node-direct')
+    } else if (isTransitive) {
+      nodeEl.classList.add('node-transitive')
+    } else {
+      nodeEl.classList.add('node-dimmed')
+    }
+  })
+
+  // Highlight connecting edges, dim others
+  svg.querySelectorAll('.edgePath').forEach(edgeEl => {
+    const classes = edgeEl.getAttribute('class') || ''
+    const match = /LS-(\S+)\s+LE-(\S+)/.exec(classes)
+    if (match) {
+      const src = match[1]
+      const dst = match[2]
+      if (blastIds.has(src) && blastIds.has(dst)) {
+        edgeEl.classList.add('edge-highlighted')
+        return
+      }
+    }
+    edgeEl.classList.add('edge-dimmed')
+  })
+}
+
+// ── Main RepoPilot Application ────────────────────────────────────────────────
 
 export default function App() {
   const [source, setSource]           = useState('tests/fixtures/sample_project')
@@ -156,14 +283,20 @@ export default function App() {
   const [busy, setBusy]               = useState(false)
   const [onboarding, setOnboarding]   = useState('')
   const [serverOk, setServerOk]       = useState(null)
-  const chatEndRef   = useRef(null)
-  const diagramRef   = useRef(null)    // ref to the diagram container DOM node
+
+  const chatEndRef = useRef(null)
+  const diagramRef = useRef(null)
 
   // Server health ping
   useEffect(() => {
-    fetch(`${API}/health`)
-      .then(r => setServerOk(r.ok))
-      .catch(() => setServerOk(false))
+    const checkServer = () => {
+      fetch(`${API}/health`)
+        .then(r => setServerOk(r.ok))
+        .catch(() => setServerOk(false))
+    }
+    checkServer()
+    const timer = setInterval(checkServer, 15000)
+    return () => clearInterval(timer)
   }, [])
 
   // Auto-scroll chat
@@ -171,26 +304,36 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chat])
 
-  function setMsg(msg, ok = true) { setStatus(msg); setStatusOk(ok) }
+  function setMsg(msg, ok = true) {
+    setStatus(msg)
+    setStatusOk(ok)
+  }
 
-  // ── analyze ────────────────────────────────────────────────────────────────
+  // ── 1. Analyze repository (supports local path or GitHub URL) ───────────────
 
   async function handleAnalyze() {
-    setBusy(true); setMsg('Analyzing repository…'); setDiagram(''); setImpact(null)
+    if (!source.trim()) return
+    setBusy(true)
+    setMsg('Analyzing repository (parsing AST, building call graph & RAG embeddings)…')
+    setImpact(null)
+
     try {
-      const res = await post('/analyze', { source, languages: ['python'] })
+      const res = await post('/analyze', {
+        source: source.trim(),
+        languages: ['python'],
+      })
       setSession(res.analysis_id)
       setStats(res)
-      setMsg(`✓ ${res.total_symbols} symbols indexed — ${res.parse_errors} parse errors`)
+      setMsg(`✓ Indexed ${res.total_symbols} symbols in ${res.modules} modules with ${res.parse_errors} parse errors`)
       await loadDiagram(res.analysis_id, diagramKind)
     } catch (e) {
-      setMsg(`✗ ${e.message}`, false)
+      setMsg(`✗ Analysis error: ${e.message}`, false)
     } finally {
       setBusy(false)
     }
   }
 
-  // ── diagram ────────────────────────────────────────────────────────────────
+  // ── Load full diagram (call graph or dependency graph) ───────────────────────
 
   async function loadDiagram(sid, kind) {
     try {
@@ -203,81 +346,91 @@ export default function App() {
 
   async function switchDiagram(kind) {
     if (!session) return
-    // Clear focus state when switching tabs
     setImpact(null)
     setDiagramKind(kind)
-    if (diagramRef.current) diagramRef.current.innerHTML = ''
     await loadDiagram(session, kind)
   }
 
-  // ── node click → impact ────────────────────────────────────────────────────
+  // ── 2 & 3. Node click → compute & highlight blast radius in-place ───────────
 
-  async function handleNodeClick(label) {
+  const handleNodeClick = useCallback(async (label) => {
     if (!session) return
-    // Immediately clear canvas so there's no stale diagram while loading
-    if (diagramRef.current) diagramRef.current.innerHTML = ''
-    setDiagram('')
-    setBusy(true); setMsg(`Computing blast radius for: ${label}…`)
+    setBusy(true)
+    setMsg(`Computing blast radius for: ${label}…`)
     try {
-      const res = await post('/impact', { analysis_id: session, symbol_fqn: label })
+      const res = await post('/impact', {
+        analysis_id: session,
+        symbol_fqn: label,
+      })
       setImpact(res)
-      setDiagram(res.diagram)
-      setMsg(`✓ Blast radius: ${res.total_impact} affected symbols · ${res.affected_tests.length} tests`)
+      const testsCount = res.affected_tests?.length || 0
+      setMsg(`✓ Blast radius: ${res.total_impact} affected symbols (${res.direct_callers.length} direct, ${testsCount} tests)`)
     } catch (e) {
-      setMsg(`Impact: ${e.message}`, false)
+      setMsg(`Impact error: ${e.message}`, false)
     } finally {
       setBusy(false)
     }
-  }
+  }, [session])
 
-  // ── reset to full graph ────────────────────────────────────────────────────
+  // ── Clear blast radius highlight and return to normal full graph ───────────
 
-  async function handleClearFocus() {
-    if (!session) return
+  function handleClearFocus() {
     setImpact(null)
-    if (diagramRef.current) diagramRef.current.innerHTML = ''
-    setDiagram('')
-    await loadDiagram(session, diagramKind)
+    setMsg('Returned to full call graph view')
   }
 
-  // ── chat ───────────────────────────────────────────────────────────────────
+  // ── 4. Q&A Assistant Chat ───────────────────────────────────────────────────
 
   async function handleChat(e) {
-    e.preventDefault()
-    if (!session || !question.trim()) return
+    if (e) e.preventDefault()
+    if (!session || !question.trim() || busy) return
     const q = question.trim()
     setQuestion('')
-    setChat(c => [...c, { role: 'user', text: q }])
+    setChat(prev => [...prev, { role: 'user', text: q }])
     setBusy(true)
+
     try {
-      const res = await post('/chat', { analysis_id: session, question: q })
-      setChat(c => [...c, {
+      const res = await post('/chat', {
+        analysis_id: session,
+        question: q,
+      })
+      setChat(prev => [...prev, {
         role:       'assistant',
         text:       res.answer,
-        citations:  res.citations,
-        confidence: res.confidence,
+        citations:  res.citations || [],
+        confidence: res.confidence || 0,
       }])
     } catch (e) {
-      setChat(c => [...c, { role: 'assistant', text: `**Error:** ${e.message}`, citations: [] }])
+      setChat(prev => [...prev, {
+        role:      'assistant',
+        text:      `**Error querying assistant:** ${e.message}`,
+        citations: [],
+      }])
     } finally {
       setBusy(false)
     }
   }
 
-  // ── export ─────────────────────────────────────────────────────────────────
+  function handleSuggestedQuestion(promptText) {
+    setQuestion(promptText)
+  }
+
+  // ── Export ONBOARDING.md ────────────────────────────────────────────────────
 
   async function handleExport() {
     if (!session) return
     setBusy(true)
     try {
-      const res  = await post('/export-onboarding', { analysis_id: session })
+      const res = await post('/export-onboarding', { analysis_id: session })
       setOnboarding(res.markdown)
       const blob = new Blob([res.markdown], { type: 'text/markdown' })
       const url  = URL.createObjectURL(blob)
       const a    = document.createElement('a')
-      a.href = url; a.download = 'ONBOARDING.md'; a.click()
+      a.href = url
+      a.download = 'ONBOARDING.md'
+      a.click()
       URL.revokeObjectURL(url)
-      setMsg('✓ ONBOARDING.md exported')
+      setMsg('✓ ONBOARDING.md generated and downloaded successfully')
     } catch (e) {
       setMsg(`Export error: ${e.message}`, false)
     } finally {
@@ -285,162 +438,344 @@ export default function App() {
     }
   }
 
-  // ── render ─────────────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
     <div className="app">
 
-      {/* ── nav header ── */}
+      {/* ── Top Header Bar ── */}
       <header className="navbar">
         <div className="navbar-left">
           <span className="logo-badge">RP</span>
           <span className="logo-title">RepoPilot</span>
-          <span className="logo-sub">TraceMind</span>
+          <span className="logo-sub">AI Onboarding & Blast Radius</span>
         </div>
         <div className="navbar-right">
-          <span className={`server-dot ${serverOk === true ? 'ok' : serverOk === false ? 'err' : 'pending'}`}>●</span>
-          <span className="server-label">
-            {serverOk === true ? 'Server Ready' : serverOk === false ? 'Server Offline' : 'Connecting…'}
-          </span>
+          <div className="server-badge">
+            <span className={`server-dot ${serverOk === true ? 'ok' : serverOk === false ? 'err' : 'pending'}`} />
+            <span>
+              {serverOk === true ? 'Server Ready' : serverOk === false ? 'Backend Offline' : 'Connecting…'}
+            </span>
+          </div>
         </div>
       </header>
 
-      {/* ── analyze bar ── */}
-      <div className="analyze-bar">
-        <input
-          className="analyze-input"
-          value={source}
-          onChange={e => setSource(e.target.value)}
-          placeholder="Local path or GitHub URL…"
-          disabled={busy}
-        />
-        <button className="btn btn-primary" onClick={handleAnalyze} disabled={busy}>
-          {busy ? <span className="spinner">⟳</span> : '⚡ Analyze'}
-        </button>
-        {session && (
-          <button className="btn btn-secondary" onClick={handleExport} disabled={busy}>
-            ↓ Export ONBOARDING.md
+      {/* ── 1. Input Section ── */}
+      <section className="analyze-bar">
+        <div className="input-row">
+          <div className="analyze-input-wrap">
+            <span className="input-icon">📁</span>
+            <input
+              className="analyze-input"
+              value={source}
+              onChange={e => setSource(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleAnalyze() }}
+              placeholder="Enter GitHub URL (e.g., https://github.com/org/repo) or local repo path..."
+              disabled={busy}
+            />
+          </div>
+          <button
+            className="btn btn-primary"
+            onClick={handleAnalyze}
+            disabled={busy || !source.trim()}
+          >
+            {busy ? <><span className="spinner">⟳</span> Analyzing…</> : '⚡ Analyze Repository'}
           </button>
-        )}
-      </div>
+          {session && (
+            <button
+              className="btn btn-secondary"
+              onClick={handleExport}
+              disabled={busy}
+            >
+              ↓ Export ONBOARDING.md
+            </button>
+          )}
+        </div>
 
-      {/* ── status bar ── */}
+        {/* Quick presets */}
+        <div className="preset-chips">
+          <span>Quick paths:</span>
+          <button
+            className="preset-chip"
+            onClick={() => setSource('tests/fixtures/sample_project')}
+          >
+            tests/fixtures/sample_project
+          </button>
+          <button
+            className="preset-chip"
+            onClick={() => setSource('.')}
+          >
+            . (RepoPilot Root)
+          </button>
+        </div>
+      </section>
+
+      {/* ── Status Message Strip ── */}
       {status && (
-        <div className={`status-bar ${statusOk ? 'ok' : 'err'}`}>{status}</div>
-      )}
-
-      {/* ── stats strip ── */}
-      {stats && (
-        <div className="stats-strip">
-          <span className="stat"><span className="stat-icon">📦</span>{stats.modules} modules</span>
-          <span className="stat"><span className="stat-icon">🔷</span>{stats.classes} classes</span>
-          <span className="stat"><span className="stat-icon">⚙️</span>{stats.methods} methods</span>
-          <span className="stat"><span className="stat-icon">𝑓</span>{stats.functions} functions</span>
-          <span className="stat"><span className="stat-icon">📊</span>{stats.indexed_chunks} chunks indexed</span>
+        <div className={`status-bar ${statusOk ? 'ok' : 'err'}`}>
+          {status}
         </div>
       )}
 
-      {/* ── main panels ── */}
+      {/* ── Summary Stats Strip ── */}
+      {stats && (
+        <div className="stats-strip">
+          <div className="stat-item">
+            <span className="stat-dot cyan" />
+            <span>Modules: <strong>{stats.modules}</strong></span>
+          </div>
+          <div className="stat-item">
+            <span className="stat-dot violet" />
+            <span>Classes: <strong>{stats.classes}</strong></span>
+          </div>
+          <div className="stat-item">
+            <span className="stat-dot emerald" />
+            <span>Methods: <strong>{stats.methods}</strong></span>
+          </div>
+          <div className="stat-item">
+            <span className="stat-dot amber" />
+            <span>Functions: <strong>{stats.functions}</strong></span>
+          </div>
+          <div className="stat-item">
+            <span>Chunks Indexed: <strong>{stats.indexed_chunks}</strong></span>
+          </div>
+          {stats.parse_errors > 0 && (
+            <div className="stat-item" style={{ color: '#f87171' }}>
+              <span>Parse Errors: <strong>{stats.parse_errors}</strong></span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Main Two-Column Viewport ── */}
       {session && (
         <div className="panels">
 
-          {/* ── left: visualizer ── */}
+          {/* ── Left Column: 2. Graph View & 3. Blast Radius ── */}
           <section className="panel panel-viz">
             <div className="panel-header">
-              <span className="panel-title">🗺 Visualizer</span>
+              <span className="panel-title">
+                <span>🗺</span> Architecture Visualizer
+              </span>
               <div className="pill-group">
-                {[['call_graph', 'Call Graph'], ['dep_graph', 'Dep Graph']].map(([k, label]) => (
-                  <button
-                    key={k}
-                    className={`pill ${diagramKind === k ? 'active' : ''}`}
-                    onClick={() => switchDiagram(k)}
-                    disabled={busy}
-                  >{label}</button>
-                ))}
+                <button
+                  className={`pill ${diagramKind === 'call_graph' ? 'active' : ''}`}
+                  onClick={() => switchDiagram('call_graph')}
+                  disabled={busy}
+                >
+                  Call Graph
+                </button>
+                <button
+                  className={`pill ${diagramKind === 'dep_graph' ? 'active' : ''}`}
+                  onClick={() => switchDiagram('dep_graph')}
+                  disabled={busy}
+                >
+                  Dependency Graph
+                </button>
               </div>
             </div>
 
+            {/* Visualizer Legend */}
+            <div className="graph-legend">
+              <div className="legend-item">
+                <span className="legend-swatch class" />
+                <span>Class</span>
+              </div>
+              <div className="legend-item">
+                <span className="legend-swatch function" />
+                <span>Function</span>
+              </div>
+              <div className="legend-item">
+                <span className="legend-swatch method" />
+                <span>Method</span>
+              </div>
+              <div className="legend-item">
+                <span className="legend-swatch test" />
+                <span>Test File (🧪)</span>
+              </div>
+              <div className="legend-hint">
+                💡 Click any node to illuminate its blast radius
+              </div>
+            </div>
+
+            {/* 3. Blast Radius Interaction Banner */}
             {impact && (
-              <div className="impact-badge">
-                <span className="impact-badge-text">
-                  Blast radius: <code>{impact.changed_fqn.split('.').slice(-2).join('.')}</code>
-                  {' — '}<strong>{impact.total_impact}</strong> affected
-                  {impact.affected_tests.length > 0 && (
-                    <span className="test-badge"> · {impact.affected_tests.length} tests 🧪</span>
-                  )}
-                </span>
-                <button className="btn-clear-focus" onClick={handleClearFocus} disabled={busy}>
-                  ← Full Graph
-                </button>
+              <div className="blast-banner">
+                <div className="blast-banner-header">
+                  <div className="blast-target-info">
+                    <span className="blast-pulse-dot" />
+                    <div>
+                      <div className="blast-target-name">
+                        Target: <span className="blast-target-fqn">{impact.changed_fqn}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    className="btn-back-graph"
+                    onClick={handleClearFocus}
+                    disabled={busy}
+                    title="Clear highlighting and restore full graph view"
+                  >
+                    ← Back to Full Graph
+                  </button>
+                </div>
+
+                <div className="blast-stats-row">
+                  <span className="blast-chip target">
+                    Target Symbol
+                  </span>
+                  <span className="blast-chip direct">
+                    ● Direct Callers: <strong>{impact.direct_callers.length}</strong>
+                  </span>
+                  <span className="blast-chip transitive">
+                    ● Transitive Callers: <strong>{impact.transitive_callers.length}</strong>
+                  </span>
+                  <span className="blast-chip tests">
+                    🧪 Affected Tests: <strong>{impact.affected_tests.length}</strong>
+                  </span>
+                  <span className="blast-chip files">
+                    📄 Affected Files: <strong>{impact.affected_files.length}</strong>
+                  </span>
+                </div>
               </div>
             )}
 
-            <div className="hint">💡 Click any node to compute its blast radius</div>
-
-            {diagram
-              ? <Diagram code={diagram} onNodeClick={handleNodeClick} containerRef={diagramRef} />
-              : <div className="diagram-empty">Run Analyze to render a diagram</div>
-            }
+            {/* Rendered Graph SVG Canvas */}
+            {diagram ? (
+              <Diagram
+                code={diagram}
+                onNodeClick={handleNodeClick}
+                impact={impact}
+                containerRef={diagramRef}
+              />
+            ) : (
+              <div className="diagram-empty">
+                <span>⚙️</span>
+                <span>Select a repository and click Analyze to generate the call graph</span>
+              </div>
+            )}
           </section>
 
-          {/* ── right: Q&A ── */}
+          {/* ── Right Column: 4. Q&A Assistant Chat Panel ── */}
           <section className="panel panel-chat">
             <div className="panel-header">
-              <span className="panel-title">💬 Q&A Assistant</span>
+              <span className="panel-title">
+                <span>💬</span> Onboarding Assistant & Q&A
+              </span>
+              {chat.length > 0 && (
+                <button
+                  className="pill"
+                  onClick={() => setChat([])}
+                  title="Clear conversation"
+                >
+                  Clear Chat
+                </button>
+              )}
             </div>
 
             <div className="chat-messages">
-              {chat.length === 0 && (
-                <div className="chat-empty">Ask anything about the repository…</div>
-              )}
-              {chat.map((m, i) => (
-                <div key={i} className={`bubble bubble-${m.role}`}>
-                  {m.role === 'user'
-                    ? <p className="bubble-text">{m.text}</p>
-                    : <div
+              {chat.length === 0 ? (
+                <div className="chat-empty">
+                  <p>Ask anything about this repository's codebase, data flow, or architecture.</p>
+                  <div className="chat-suggested">
+                    <button
+                      className="suggested-btn"
+                      onClick={() => handleSuggestedQuestion('What does UserService do and how is it used?')}
+                    >
+                      "What does UserService do?"
+                    </button>
+                    <button
+                      className="suggested-btn"
+                      onClick={() => handleSuggestedQuestion('What is the blast radius if get_user signature changes?')}
+                    >
+                      "What calls get_user?"
+                    </button>
+                    <button
+                      className="suggested-btn"
+                      onClick={() => handleSuggestedQuestion('Where are the unit tests located and what do they verify?')}
+                    >
+                      "Where are tests located?"
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                chat.map((m, i) => (
+                  <div key={i} className={`bubble bubble-${m.role}`}>
+                    <div className="bubble-role-label">
+                      {m.role === 'user' ? 'You' : 'RepoPilot Assistant'}
+                    </div>
+
+                    {m.role === 'user' ? (
+                      <p className="bubble-text">{m.text}</p>
+                    ) : (
+                      <div
                         className="bubble-text md-body"
                         dangerouslySetInnerHTML={{ __html: renderMarkdown(m.text) }}
                       />
-                  }
-                  {m.citations?.length > 0 && (
-                    <div className="citations">
-                      {m.citations.slice(0, 3).map((c, j) => (
-                        <span key={j} className="citation-chip">
-                          📍 <code>{c.file_path.split('/').pop()}:{c.line}</code>
-                        </span>
-                      ))}
-                      <span className="confidence-chip">
-                        {Math.round((m.confidence || 0) * 100)}% conf
-                      </span>
-                    </div>
-                  )}
-                </div>
-              ))}
+                    )}
+
+                    {/* Citations & Confidence Chip (Requirement 4) */}
+                    {m.role === 'assistant' && (
+                      <div className="citations">
+                        {(m.citations || []).slice(0, 4).map((c, j) => {
+                          const fileName = c.file_path ? c.file_path.split('/').pop() : ''
+                          return (
+                            <span
+                              key={j}
+                              className="citation-chip"
+                              title={c.fqn || c.file_path}
+                            >
+                              📍 <code>{fileName ? `${fileName}:${c.line}` : c.fqn}</code>
+                            </span>
+                          )
+                        })}
+
+                        {m.confidence !== undefined && (
+                          <span
+                            className={`confidence-chip ${
+                              m.confidence >= 0.7 ? 'high' : m.confidence >= 0.4 ? 'medium' : 'low'
+                            }`}
+                            title="Retrieval-augmented confidence score"
+                          >
+                            {Math.round((m.confidence || 0) * 100)}% confidence
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
               <div ref={chatEndRef} />
             </div>
 
+            {/* Chat Input Box */}
             <form className="chat-form" onSubmit={handleChat}>
               <input
                 className="chat-input"
                 value={question}
                 onChange={e => setQuestion(e.target.value)}
-                placeholder="e.g. What does get_user do?"
+                placeholder="Ask a question about the codebase..."
                 disabled={busy}
               />
               <button
                 type="submit"
                 className="btn btn-primary"
                 disabled={busy || !question.trim()}
-              >Send</button>
+              >
+                Send
+              </button>
             </form>
           </section>
         </div>
       )}
 
-      {/* ── onboarding preview ── */}
+      {/* ── Collapsible ONBOARDING.md Markdown Preview ── */}
       {onboarding && (
         <details className="onboarding-preview">
-          <summary>Preview ONBOARDING.md</summary>
+          <summary>
+            <span>📄 Exported ONBOARDING.md Preview</span>
+            <span style={{ fontSize: '11px', color: '#818cf8' }}>Click to toggle</span>
+          </summary>
           <pre>{onboarding}</pre>
         </details>
       )}

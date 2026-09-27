@@ -76,7 +76,14 @@ class MermaidRenderer:
 
         visible_fqns: Set[str] = {n.fqn for n in nodes}
 
-        # Emit node declarations with shapes and tooltips
+        # Class definitions for distinct symbol kinds
+        lines.append("    classDef classNode fill:#2d1b69,stroke:#a78bfa,stroke-width:2px,color:#f5f3ff")
+        lines.append("    classDef functionNode fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#ecfdf5")
+        lines.append("    classDef methodNode fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#f0f9ff")
+        lines.append("    classDef defaultNode fill:#1e293b,stroke:#64748b,stroke-width:1.5px,color:#f8fafc")
+        lines.append("")
+
+        # Emit node declarations with shapes, kind classes, and click callbacks
         for node in nodes:
             nid   = _fqn_to_id(node.fqn)
             label = _short_name(node.fqn)
@@ -84,13 +91,18 @@ class MermaidRenderer:
 
             if kind == "function":
                 shape = f'([{label}])'
+                klass = "functionNode"
             elif kind == "class":
                 shape = f'[[{label}]]'
-            else:
-                # method, module, unknown → rounded rectangle
+                klass = "classNode"
+            elif kind == "method":
                 shape = f'({label})'
+                klass = "methodNode"
+            else:
+                shape = f'({label})'
+                klass = "defaultNode"
 
-            lines.append(f'    {nid}{shape}')
+            lines.append(f'    {nid}{shape}:::{klass}')
             lines.append(f'    click {nid} callback "{node.fqn}"')
 
         lines.append("")
