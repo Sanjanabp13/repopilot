@@ -31,6 +31,10 @@ def _short_name(fqn: str) -> str:
 # Renderer
 # ---------------------------------------------------------------------------
 
+# Maximum nodes to render in full-repo graphs before capping kicks in.
+_MAX_NODES = 80
+
+
 class MermaidRenderer:
     """Renders analysis data structures as Mermaid diagram strings."""
 
@@ -54,12 +58,23 @@ class MermaidRenderer:
         Only resolved edges are rendered by default; unresolved edges are
         shown as dashed (``-.->``) to distinguish "dark" call targets.
         """
-        lines: List[str] = [f"---", f"title: {title}", f"---", "flowchart LR"]
+        lines: List[str] = [f"flowchart LR"]
 
         nodes = call_graph.all_nodes()
         if not nodes:
             lines.append("    %% empty graph")
             return self._wrap(lines)
+
+        # Cap to top-N most-connected nodes when the graph is large
+        if len(nodes) > _MAX_NODES:
+            nodes = sorted(
+                nodes,
+                key=lambda n: len(n.calls) + len(n.called_by),
+                reverse=True,
+            )[:_MAX_NODES]
+            lines.append(f"    %% showing top {_MAX_NODES} nodes by connectivity")
+
+        visible_fqns: Set[str] = {n.fqn for n in nodes}
 
         # Emit node declarations with shapes and tooltips
         for node in nodes:
@@ -80,9 +95,11 @@ class MermaidRenderer:
 
         lines.append("")
 
-        # Emit edges
+        # Emit edges — only between visible nodes
         seen_edges: Set[tuple] = set()
         for caller_fqn, callee_fqn, edge in call_graph.edges():
+            if caller_fqn not in visible_fqns or callee_fqn not in visible_fqns:
+                continue
             key = (caller_fqn, callee_fqn)
             if key in seen_edges:
                 continue
@@ -109,19 +126,34 @@ class MermaidRenderer:
         Internal modules use solid rectangle nodes; external packages use
         a dashed style applied via ``classDef``.
         """
-        lines: List[str] = [f"---", f"title: {title}", f"---", "flowchart TD"]
+        lines: List[str] = [f"flowchart TD"]
 
-        nodes = dep_graph.all_nodes()
-        if not nodes:
+        all_nodes = dep_graph.all_nodes()
+        if not all_nodes:
             lines.append("    %% empty graph")
             return self._wrap(lines)
 
-        # classDef for external packages
+        # Prefer internal modules; fall back to all nodes when few enough
+        internal = [n for n in all_nodes if n.is_internal]
+        nodes = internal if internal else all_nodes
+
+        # Cap total nodes
+        if len(nodes) > _MAX_NODES:
+            # Sort internal modules by total degree (imports + imported_by)
+            nodes = sorted(
+                nodes,
+                key=lambda n: len(n.imports) + len(n.imported_by),
+                reverse=True,
+            )[:_MAX_NODES]
+            lines.append(f"    %% showing top {_MAX_NODES} modules by connectivity")
+
+        visible_fqns: Set[str] = {n.fqn for n in nodes}
+
+        # classDef for external packages (only declared if any slip through)
         lines.append("    classDef external stroke-dasharray:5 5,fill:#f0f0f0,color:#555")
         lines.append("")
 
         external_ids: List[str] = []
-
         for node in nodes:
             nid   = _fqn_to_id(node.fqn)
             label = _short_name(node.fqn)
@@ -135,9 +167,11 @@ class MermaidRenderer:
 
         lines.append("")
 
-        # Edges: importer --> importee
+        # Edges: importer --> importee — only between visible nodes
         seen_edges: Set[tuple] = set()
         for importer, importee, _edge in dep_graph.edges():
+            if importer not in visible_fqns or importee not in visible_fqns:
+                continue
             key = (importer, importee)
             if key in seen_edges:
                 continue
@@ -167,7 +201,7 @@ class MermaidRenderer:
         - Transitive callers: ``fill:#fff3cd`` (light yellow)
         - Test files       : ``fill:#cce5ff`` (blue) — overrides hop colour
         """
-        lines: List[str] = [f"---", f"title: {title}", f"---", "flowchart LR"]
+        lines: List[str] = [f"flowchart LR"]
 
         # --- collect all FQNs in this diagram ---------------------------------
         all_symbols = impact_result.all_impacted()
@@ -184,11 +218,13 @@ class MermaidRenderer:
 
         # --- node declarations ------------------------------------------------
         lines.append(f'    {changed_id}(("{changed_label}"))')  # double circle = changed
+        lines.append(f'    click {changed_id} callback "{changed_fqn}"')
 
         for sym in all_symbols:
             nid   = _fqn_to_id(sym.fqn)
             label = sym.name or _short_name(sym.fqn)
             lines.append(f'    {nid}["{label}"]')
+            lines.append(f'    click {nid} callback "{sym.fqn}"')
 
         lines.append("")
 

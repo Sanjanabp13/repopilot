@@ -1,27 +1,19 @@
 """
-vector_store.py — ChromaDB-backed vector store for RepoPilot symbol chunks.
+vector_store.py — in-memory keyword/TF-IDF store for RepoPilot symbol chunks.
 
-Class: VectorStore
-  Wraps a local ChromaDB PersistentClient and exposes upsert / query / clear
-  operations over a single "repopilot_symbols" collection.
+Keeps the exact same public interface as the original ChromaDB-backed version
+so rag_chain.py requires zero changes.  Uses pure-Python cosine similarity
+over the TF-IDF vectors produced by embedder.py.
+
+ChromaDB is no longer required at runtime.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List
+import math
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Optional dependency guard
-# ---------------------------------------------------------------------------
-
-try:
-    import chromadb  # noqa: F401 — checked at import time
-    _CHROMA_AVAILABLE = True
-except ImportError:
-    _CHROMA_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -29,36 +21,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class VectorStore:
-    """Local ChromaDB vector store for symbol chunks.
+    """In-memory vector store using dot-product cosine similarity.
 
     Parameters
     ----------
     persist_dir:
-        Directory on disk where ChromaDB will persist its data.
-        Created automatically if it does not exist.
+        Accepted for API compatibility; ignored (no disk persistence).
     """
 
     COLLECTION_NAME = "repopilot_symbols"
 
     def __init__(self, persist_dir: str = ".repopilot/chroma") -> None:
-        if not _CHROMA_AVAILABLE:
-            raise ImportError(
-                "chromadb is not installed. "
-                "Run: pip install chromadb"
-            )
-
-        import chromadb as _chromadb
-
-        self._client = _chromadb.PersistentClient(path=persist_dir)
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
-        logger.debug(
-            "VectorStore initialised (persist_dir=%s, collection=%s)",
-            persist_dir,
-            self.COLLECTION_NAME,
-        )
+        # persist_dir kept for interface compatibility — not used
+        self._ids:        list[str]         = []
+        self._documents:  list[str]         = []
+        self._metadatas:  list[dict]        = []
+        self._embeddings: list[list[float]] = []
+        logger.debug("VectorStore initialised (in-memory, no ChromaDB)")
 
     # ------------------------------------------------------------------
     # Write
@@ -69,35 +48,34 @@ class VectorStore:
         chunks: list[dict],
         embeddings: list[list[float]],
     ) -> None:
-        """Upsert *chunks* with their pre-computed *embeddings*.
+        """Upsert chunks with their pre-computed embeddings.
 
-        Parameters
-        ----------
-        chunks:
-            List of chunk dicts with keys ``id``, ``text``, ``metadata``.
-        embeddings:
-            Parallel list of float vectors (one per chunk).
+        Existing entries with the same ``id`` are replaced.
         """
         if not chunks:
             return
-
         if len(chunks) != len(embeddings):
             raise ValueError(
                 f"chunks length ({len(chunks)}) != embeddings length ({len(embeddings)})"
             )
 
-        ids        = [c["id"]       for c in chunks]
-        documents  = [c["text"]     for c in chunks]
-        metadatas  = [c["metadata"] for c in chunks]
+        # Build an index map for O(1) upsert lookups
+        existing = {cid: i for i, cid in enumerate(self._ids)}
 
-        # ChromaDB upsert handles both insert and update (idempotent).
-        self._collection.upsert(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-            embeddings=embeddings,
-        )
-        logger.debug("Upserted %d chunks into collection.", len(chunks))
+        for chunk, vec in zip(chunks, embeddings):
+            cid = chunk["id"]
+            if cid in existing:
+                idx = existing[cid]
+                self._documents[idx]  = chunk["text"]
+                self._metadatas[idx]  = chunk["metadata"]
+                self._embeddings[idx] = vec
+            else:
+                self._ids.append(cid)
+                self._documents.append(chunk["text"])
+                self._metadatas.append(chunk["metadata"])
+                self._embeddings.append(vec)
+
+        logger.debug("Upserted %d chunks (total=%d).", len(chunks), len(self._ids))
 
     # ------------------------------------------------------------------
     # Read
@@ -108,7 +86,7 @@ class VectorStore:
         query_embedding: list[float],
         top_k: int = 5,
     ) -> list[dict]:
-        """Return the top-*k* nearest neighbours for *query_embedding*.
+        """Return the top-*k* nearest chunks by cosine similarity.
 
         Returns
         -------
@@ -119,50 +97,49 @@ class VectorStore:
                     "id":       str,
                     "text":     str,
                     "metadata": dict,
-                    "distance": float,   # lower = more similar (cosine distance)
-                    "score":    float,   # 1 - distance, clamped to [0, 1]
+                    "distance": float,   # 1 - cosine_similarity
+                    "score":    float,   # cosine_similarity, clamped [0, 1]
                 }
         """
-        if self.collection_size() == 0:
+        if not self._embeddings:
             return []
 
-        effective_k = min(top_k, self.collection_size())
-        raw = self._collection.query(
-            query_embeddings=[query_embedding],
-            n_results=effective_k,
-            include=["documents", "metadatas", "distances"],
-        )
+        q = query_embedding
+        q_norm = math.sqrt(sum(v * v for v in q)) or 1.0
 
-        results: list[dict] = []
-        for idx in range(len(raw["ids"][0])):
-            distance = float(raw["distances"][0][idx])
-            # Cosine distance ∈ [0, 2]; normalise score to [0, 1].
-            score = max(0.0, min(1.0, 1.0 - distance))
-            results.append(
-                {
-                    "id":       raw["ids"][0][idx],
-                    "text":     raw["documents"][0][idx],
-                    "metadata": raw["metadatas"][0][idx],
-                    "distance": distance,
-                    "score":    score,
-                }
-            )
+        scores: list[tuple[float, int]] = []
+        for idx, vec in enumerate(self._embeddings):
+            dot = sum(a * b for a, b in zip(q, vec))
+            v_norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            cosine = dot / (q_norm * v_norm)
+            scores.append((cosine, idx))
 
-        return results
+        scores.sort(key=lambda x: x[0], reverse=True)
+        top = scores[: min(top_k, len(scores))]
+
+        return [
+            {
+                "id":       self._ids[idx],
+                "text":     self._documents[idx],
+                "metadata": self._metadatas[idx],
+                "distance": float(max(0.0, 1.0 - cosine)),
+                "score":    float(max(0.0, min(1.0, cosine))),
+            }
+            for cosine, idx in top
+        ]
 
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
 
     def collection_size(self) -> int:
-        """Return the number of documents currently in the collection."""
-        return self._collection.count()
+        """Return the number of documents currently stored."""
+        return len(self._ids)
 
     def clear(self) -> None:
-        """Delete and recreate the collection (for full re-indexing)."""
-        self._client.delete_collection(self.COLLECTION_NAME)
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
-        logger.info("Collection '%s' cleared and recreated.", self.COLLECTION_NAME)
+        """Remove all stored chunks (for full re-indexing)."""
+        self._ids        = []
+        self._documents  = []
+        self._metadatas  = []
+        self._embeddings = []
+        logger.info("VectorStore cleared.")

@@ -53,8 +53,10 @@ class RAGChain:
     embedder:
         Pre-initialised :class:`~src.knowledge.embedder.Embedder`.
     confidence_threshold:
-        Minimum retrieval score (0–1) needed before calling the LLM.
-        Below this value, the chain returns "No confident answer found."
+        If the best retrieval score is below this value the chain falls
+        back to a keyword search against the symbol index rather than
+        returning "No confident answer found."  Set to 0.0 to always use
+        retrieved chunks.
     top_k:
         Number of chunks to retrieve per question.
     model_id:
@@ -65,16 +67,17 @@ class RAGChain:
         self,
         vector_store: VectorStore,
         embedder: Embedder,
-        confidence_threshold: float = 0.35,
+        confidence_threshold: float = 0.15,
         top_k: int = 5,
         model_id: str = "ibm/granite-3-8b-instruct",
     ) -> None:
-        self._vs                  = vector_store
-        self._embedder            = embedder
+        self._vs                   = vector_store
+        self._embedder             = embedder
         self._confidence_threshold = confidence_threshold
-        self._top_k               = top_k
-        self._model_id            = model_id
-        self._llm                 = self._init_llm(model_id)
+        self._top_k                = top_k
+        self._model_id             = model_id
+        self._llm                  = self._init_llm(model_id)
+        self._index: "SymbolIndex | None" = None   # set by index_repository
 
     # ------------------------------------------------------------------
     # LLM initialisation
@@ -127,20 +130,8 @@ class RAGChain:
         index: "SymbolIndex",
         parse_results: list[dict],
     ) -> int:
-        """Chunk, embed, and store every chunkable symbol in *index*.
-
-        Parameters
-        ----------
-        index:
-            Populated :class:`~src.analysis.symbol_index.SymbolIndex`.
-        parse_results:
-            Raw parser result dicts (forwarded to :class:`CodeChunker`).
-
-        Returns
-        -------
-        int
-            Number of chunks successfully indexed.
-        """
+        """Chunk, embed, and store every chunkable symbol in *index*."""
+        self._index = index   # keep reference for keyword fallback
         chunker = CodeChunker()
         chunks  = chunker.chunk_symbols(index, parse_results)
 
@@ -197,21 +188,28 @@ class RAGChain:
         results = self._vs.query(query_vector, top_k=self._top_k)
 
         if not results:
-            return self._no_answer("Vector store returned no results.")
+            return self._keyword_fallback(question)
 
         max_score = max(r["score"] for r in results)
 
-        # 3. Confidence gate
+        # 3. Low-confidence: supplement with keyword fallback chunks
         if max_score < self._confidence_threshold:
-            return {
-                "answer":           "No confident answer found for this question.",
-                "citations":        [],
-                "confidence":       0.0,
-                "retrieved_chunks": len(results),
-            }
+            results = self._keyword_fallback_chunks(question) or results
 
-        # 4. Build context block
-        context_block = "\n\n---\n\n".join(r["text"] for r in results)
+        # 4. Build structured context block (Markdown headers + code)
+        context_parts = []
+        for r in results:
+            meta = r["metadata"]
+            fqn  = meta.get("fqn", "")
+            fp   = meta.get("file_path", "")
+            ln   = meta.get("line", 0)
+            kind = meta.get("kind", "symbol")
+            context_parts.append(
+                f"### `{fqn}` ({kind})\n"
+                f"**File:** `{fp}:{ln}`\n\n"
+                f"```python\n{r['text']}\n```"
+            )
+        context_block = "\n\n".join(context_parts)
 
         # 5. Build citations
         citations = [
@@ -224,11 +222,21 @@ class RAGChain:
             for r in results
         ]
 
-        # 6. Generate answer (or fall back to context-only)
+        # 6. Generate answer (or fall back to structured context summary)
         if self._llm is None:
+            # Format as a clean Markdown summary of top hits
+            bullets = []
+            for r in results[:3]:
+                meta = r["metadata"]
+                doc_line = r["text"].split("\n")[2] if len(r["text"].split("\n")) > 2 else ""
+                bullets.append(
+                    f"- **`{meta.get('fqn','')}`** "
+                    f"(`{meta.get('file_path','').split('/')[-1]}:{meta.get('line',0)}`)"
+                    + (f"\n  > {doc_line.strip()}" if doc_line.strip() else "")
+                )
             answer_text = (
-                "LLM not configured. Top retrieved context:\n\n"
-                + context_block[:1000]
+                "**Top matches** (LLM not configured — showing retrieved symbols):\n\n"
+                + "\n".join(bullets)
             )
         else:
             prompt = _PROMPT_TEMPLATE.format(
@@ -236,13 +244,18 @@ class RAGChain:
                 question=question,
             )
             try:
-                response   = self._llm.generate_text(prompt=prompt)
+                response    = self._llm.generate_text(prompt=prompt)
                 answer_text = response if isinstance(response, str) else str(response)
             except Exception as exc:  # noqa: BLE001
                 logger.error("LLM generation failed: %s", exc)
                 answer_text = (
-                    "LLM generation failed. Top retrieved context:\n\n"
-                    + context_block[:1000]
+                    "**LLM generation failed.** Top matches:\n\n"
+                    + "\n".join(
+                        f"- `{r['metadata'].get('fqn','')}` — "
+                        f"`{r['metadata'].get('file_path','').split('/')[-1]}"
+                        f":{r['metadata'].get('line',0)}`"
+                        for r in results[:3]
+                    )
                 )
 
         return {
@@ -255,6 +268,77 @@ class RAGChain:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _keyword_fallback_chunks(self, question: str) -> list[dict]:
+        """Return pseudo-chunks for symbols whose name appears in *question*."""
+        if self._index is None:
+            return []
+        tokens = set(question.lower().split())
+        hits = []
+        for sym in self._index.all_symbols():
+            if sym.name.lower() in tokens or any(t in sym.name.lower() for t in tokens if len(t) > 3):
+                hits.append({
+                    "id":       sym.fqn,
+                    "text":     (
+                        f"# {sym.kind.value}: {sym.fqn}\n"
+                        f"# File: {sym.file_path}:{sym.line}\n"
+                        f"{sym.docstring or ''}"
+                    ),
+                    "metadata": {
+                        "fqn":       sym.fqn,
+                        "file_path": sym.file_path,
+                        "line":      sym.line,
+                        "kind":      sym.kind.value,
+                        "name":      sym.name,
+                    },
+                    "distance": 0.5,
+                    "score":    0.5,
+                })
+        return hits[:self._top_k]
+
+    def _keyword_fallback(self, question: str) -> dict:
+        """Full fallback when vector store has no results at all."""
+        chunks = self._keyword_fallback_chunks(question)
+        if not chunks:
+            return self._no_answer("No matching symbols found.")
+        context_block = "\n\n---\n\n".join(c["text"] for c in chunks)
+        citations = [
+            {
+                "fqn":       c["metadata"]["fqn"],
+                "file_path": c["metadata"]["file_path"],
+                "line":      int(c["metadata"]["line"]),
+                "snippet":   c["text"][:200],
+            }
+            for c in chunks
+        ]
+        if self._llm is None:
+            bullets = []
+            for c in chunks[:3]:
+                meta = c["metadata"]
+                doc_line = c["text"].split("\n")[2] if len(c["text"].split("\n")) > 2 else ""
+                bullets.append(
+                    f"- **`{meta.get('fqn','')}`** "
+                    f"(`{meta.get('file_path','').split('/')[-1]}:{meta.get('line',0)}`)"
+                    + (f"\n  > {doc_line.strip()}" if doc_line.strip() else "")
+                )
+            answer_text = (
+                "**Top keyword matches** (LLM not configured):\n\n"
+                + "\n".join(bullets)
+            )
+        else:
+            prompt = _PROMPT_TEMPLATE.format(context_block=context_block, question=question)
+            try:
+                response = self._llm.generate_text(prompt=prompt)
+                answer_text = response if isinstance(response, str) else str(response)
+            except Exception as exc:
+                logger.error("LLM generation failed: %s", exc)
+                answer_text = "LLM generation failed. Top keyword matches:\n\n" + context_block[:1000]
+        return {
+            "answer":           answer_text,
+            "citations":        citations,
+            "confidence":       0.5,
+            "retrieved_chunks": len(chunks),
+        }
 
     @staticmethod
     def _no_answer(reason: str) -> dict:
